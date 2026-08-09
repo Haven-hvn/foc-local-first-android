@@ -193,14 +193,14 @@ internal class LocalStore(
                     last_access_ms = excluded.last_access_ms,
                     expires_at_ms = excluded.expires_at_ms
                 """.trimIndent(),
-                arrayOf(pieceCid, size, lastAccess, expiresAt),
+                arrayOf<Any>(pieceCid as Any, size as Any, lastAccess as Any, expiresAt as Any),
             )
         }
 
         fun touch(pieceCid: String, lastAccess: Long) {
             helper.writableDatabase.execSQL(
                 "UPDATE pieces SET last_access_ms = ? WHERE piece_cid = ?",
-                arrayOf(lastAccess, pieceCid),
+                arrayOf<Any>(lastAccess as Any, pieceCid as Any),
             )
         }
 
