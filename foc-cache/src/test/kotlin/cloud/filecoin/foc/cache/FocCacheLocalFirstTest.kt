@@ -147,7 +147,7 @@ class FocCacheLocalFirstTest {
         val err = runCatching { cache.get(ref) }.exceptionOrNull()
         assertNotNull(err)
         assertTrue(err is PieceUnavailableException)
-        val msg = err.message ?: ""
+        val msg = err?.message ?: ""
         assertTrue(msg.contains("non-2xx"))
         assertTrue(msg.contains(ref.pieceCid))
     }
