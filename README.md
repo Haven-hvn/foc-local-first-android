@@ -1,5 +1,7 @@
 # foc-local-first-android
 
+[![Maven Central](https://img.shields.io/maven-central/v/io.github.haven-hvn/foc-cache.svg)](https://central.sonatype.com/artifact/io.github.haven-hvn/foc-cache)
+
 A Kotlin/Android library that gives you the **local-first, retrieve-from-network-on-miss**
 UX from the Logos storage module (`logos-storage-nim`'s `NetworkStore` + `RepoStore`),
 retargeted at **Filecoin Onchain Cloud** content uploaded via `synapse-sdk`.
@@ -131,10 +133,11 @@ on directly.
 
 ## Wiring into an Android project
 
-`settings.gradle.kts`:
+Add the Maven Central dependency in your module's `build.gradle.kts`:
 ```kotlin
-include(":foc-cache")
-project(":foc-cache").projectDir = file("../foc-local-first-android/foc-cache")
+dependencies {
+    implementation("io.github.haven-hvn:foc-cache:0.1.0")
+}
 ```
 
 `Application`:

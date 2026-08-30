@@ -8,10 +8,6 @@ out/
 gradle-app.properties
 gradle/wrapper/gradle-wrapper.jar
 
-# Kotlin
-*.class
-*.kt.bak
-
 # Android / AAR
 *.aar
 *.apk
@@ -38,31 +34,20 @@ captures/
 *.pom
 *.asc
 *.module
-*.kotlin_module
 
 # IDE
 .idea/
 *.iml
 *.ipr
 *.iws
-.kilo/
-.kotlin/
-.vscode/
-
-# OS
-.DS_Store
-Thumbs.db
 
 # Gradle local
 gradle/local.properties
 
-# Secrets / signing — never commit
+# Secrets / signing
 *.jks
 *.keystore
 keystore.properties
 secring.gpg
 pubring.gpg
 *.gpg
-
-# Local Maven publish cache (if you publishMavenLocal during dev)
-.m2/
