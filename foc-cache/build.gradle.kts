@@ -1,5 +1,7 @@
 plugins {
-    id("com.android.library")
+    alias(libs.plugins.android.library)
+    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.vanniktech.maven.publish)
 }
 
 android {
@@ -13,6 +15,38 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
+    }
+}
+
+mavenPublishing {
+    publishToMavenCentral(automaticRelease = true)
+    signAllPublications()
+
+    coordinates(group.toString(), project.name, version.toString())
+
+    pom {
+        name.set(project.name)
+        description.set("A Kotlin/Android library that gives you the local-first, retrieve-from-network-on-miss UX from the Logos storage module, retargeted at Filecoin Onchain Cloud content uploaded via synapse-sdk.")
+        inceptionYear.set("2026")
+        url.set("https://github.com/Haven-hvn/foc-local-first-android")
+        licenses {
+            license {
+                name.set("Apache License 2.0")
+                url.set("https://www.apache.org/licenses/LICENSE-2.0")
+            }
+        }
+        developers {
+            developer {
+                id.set("haven")
+                name.set("Haven")
+                url.set("https://github.com/Haven-hvn")
+            }
+        }
+        scm {
+            url.set("https://github.com/Haven-hvn/foc-local-first-android")
+            connection.set("scm:git:git://github.com/Haven-hvn/foc-local-first-android.git")
+            developerConnection.set("scm:git:ssh://github.com/Haven-hvn/foc-local-first-android.git")
+        }
     }
 }
 

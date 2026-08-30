@@ -1,0 +1,68 @@
+# Build outputs
+build/
+bin/
+out/
+
+# Gradle
+.gradle/
+gradle-app.properties
+gradle/wrapper/gradle-wrapper.jar
+
+# Kotlin
+*.class
+*.kt.bak
+
+# Android / AAR
+*.aar
+*.apk
+*.aab
+*.ap_
+*.dex
+local.properties
+proguard/
+*.log
+
+# Generated source
+captures/
+.cxx/
+**/generated/
+**/R.java
+**/BuildConfig.java
+**/R.jar
+**/res/processed/
+
+# Maven
+*.jar
+*.war
+*.ear
+*.pom
+*.asc
+*.module
+*.kotlin_module
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.kilo/
+.kotlin/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Gradle local
+gradle/local.properties
+
+# Secrets / signing — never commit
+*.jks
+*.keystore
+keystore.properties
+secring.gpg
+pubring.gpg
+*.gpg
+
+# Local Maven publish cache (if you publishMavenLocal during dev)
+.m2/
