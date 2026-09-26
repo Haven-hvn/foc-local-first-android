@@ -1,9 +1,12 @@
 package cloud.filecoin.foc.cache
 
 import android.content.Context
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
-import java.io.ByteArrayInputStream
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.withContext
+import java.io.File
 
 /**
  * Public API. This is the class an app calls.
@@ -41,45 +44,82 @@ class FocCache(
     private val chunkSize: Int = config.chunkSize
 
     /**
-     * Local-first retrieval. Returns cached bytes if fresh; otherwise fetches
-     * from the first successful SP endpoint (or Trustless Gateway fallback),
-     * stores them locally, and returns them.
+     * Local-first retrieval into memory. Returns cached bytes if fresh; otherwise fetches from the
+     * first successful SP endpoint (or Trustless Gateway fallback), stores them locally, and returns
+     * them. For large pieces prefer [file] or [stream], which never hold the whole piece in memory.
      *
+     * @param transform applied once when the piece arrives; see [PieceTransform].
      * @throws PieceUnavailableException on total network failure with an empty cache.
      */
-    suspend fun get(ref: PieceRef): ByteArray = net.get(ref)
+    suspend fun get(ref: PieceRef, transform: PieceTransform? = null): ByteArray =
+        withContext(Dispatchers.IO) {
+            val m = net.materialize(ref, transform)
+            try {
+                m.file.readBytes()
+            } finally {
+                if (!m.cached) m.file.delete()
+            }
+        }
 
     /**
-     * Streaming variant. First emits nothing until the piece is available in the
-     * local store (fetching it from the network if needed), then re-opens the
-     * local file and emits [Config.chunkSize] byte chunks.
+     * The piece as a local file, fetching (and transforming) it first on a miss. Hand the path to
+     * anything that reads files — a media player, a decoder — with no copy in memory.
      *
-     * This deliberately doesn't stream directly from the HTTP response so that
-     * a subsequent read of the same piece is a local hit — matching how the
-     * nim `StoreStream` walks the local `RepoStore`.
+     * The file is owned by the cache: don't modify or delete it. It stays until the piece is evicted
+     * or [remove]d; a stream already open on it keeps working after that. Each call counts as an
+     * access for LRU.
+     *
+     * @throws QuotaExceededException if the piece is larger than the whole quota.
+     * @throws PieceUnavailableException on total network failure with an empty cache.
      */
-    fun stream(ref: PieceRef): Flow<ByteArray> = flow {
-        val bytes = net.get(ref)
-        val stream = ByteArrayInputStream(bytes)
-        val buf = ByteArray(chunkSize)
-        while (true) {
-            val n = stream.read(buf)
-            if (n <= 0) break
-            emit(buf.copyOf(n))
+    suspend fun file(ref: PieceRef, transform: PieceTransform? = null): File {
+        val m = net.materialize(ref, transform)
+        if (!m.cached) {
+            m.file.delete()
+            throw QuotaExceededException("Piece ${ref.pieceCid} doesn't fit in the cache quota ($quotaBytes bytes)")
         }
+        return m.file
     }
+
+    /**
+     * Streaming variant. Emits nothing until the piece is on disk (fetching it from the network if
+     * needed), then reads the local file in [Config.chunkSize] chunks. The piece is never held in
+     * memory as a whole, and a later read of the same piece is a local hit — matching how the nim
+     * `StoreStream` walks the local `RepoStore`.
+     */
+    fun stream(ref: PieceRef, transform: PieceTransform? = null): Flow<ByteArray> = flow {
+        val m = net.materialize(ref, transform)
+        try {
+            m.file.inputStream().use { input ->
+                val buf = ByteArray(chunkSize)
+                while (true) {
+                    val n = input.read(buf)
+                    if (n <= 0) break
+                    emit(buf.copyOf(n))
+                }
+            }
+        } finally {
+            if (!m.cached) m.file.delete()
+        }
+    }.flowOn(Dispatchers.IO)
 
     /** Offline-friendly existence check; touches only the local metadata + fs. */
     fun exists(pieceCid: String): Boolean = net.exists(pieceCid)
 
     /**
-     * Prefetch [ref] into the local cache. Useful before entering offline mode
-     * or as a background job. Idempotent.
+     * Prefetch [ref] into the local cache, applying [transform] if it has to be fetched. Useful as a
+     * background job. Idempotent.
      */
-    suspend fun fetch(ref: PieceRef) = net.warm(ref)
+    suspend fun fetch(ref: PieceRef, transform: PieceTransform? = null) {
+        val m = net.materialize(ref, transform)
+        if (!m.cached) m.file.delete()
+    }
 
     /** Drop the piece from local cache (returns true if it was present). */
     fun remove(pieceCid: String): Boolean = net.remove(pieceCid)
+
+    /** The quota in force — [Config.quotaBytes], or the value [Config.autoQuota] resolved to. */
+    val quotaBytes: Long get() = local.quotaBytes
 
     /** Quota / usage summary. */
     fun space(): SpaceInfo = net.space()

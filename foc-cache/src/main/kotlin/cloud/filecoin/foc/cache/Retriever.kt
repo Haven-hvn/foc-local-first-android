@@ -1,5 +1,7 @@
 package cloud.filecoin.foc.cache
 
+import java.io.File
+
 /**
  * Plug point for the "network on miss" side.
  *
@@ -34,4 +36,14 @@ interface Retriever {
      * bytes.
      */
     suspend fun fetch(ref: PieceRef): ByteArray
+
+    /**
+     * Write the piece to [target] (created or truncated) or throw
+     * [PieceUnavailableException]. This is what the cache calls; override it
+     * to stream large pieces without holding them in memory. The default
+     * buffers through [fetch], so existing retrievers keep working.
+     */
+    suspend fun fetchTo(ref: PieceRef, target: File) {
+        target.writeBytes(fetch(ref))
+    }
 }

@@ -10,8 +10,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import okhttp3.Call
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
+import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
@@ -50,6 +54,7 @@ import java.util.concurrent.TimeUnit
  * download." **This implementation does not verify yet.** See README caveats.
  * Verification is required for parity and is queued for a follow-up.
  */
+@OptIn(ExperimentalCoroutinesApi::class) // CompletableDeferred.getCompleted
 internal class RemoteStore(
     private val config: Config,
     private val resolver: ProviderResolver? =
@@ -58,15 +63,30 @@ internal class RemoteStore(
         else null,
 ) : Retriever {
 
+    // No callTimeout: bodies stream to disk and a large piece can legitimately take minutes.
+    // connect + read (inactivity) timeouts still bound a dead or stalled provider.
     private val http: OkHttpClient = OkHttpClient.Builder()
-        .callTimeout(config.fetchTimeout.toMillis(), TimeUnit.MILLISECONDS)
         .connectTimeout(config.fetchTimeout.toMillis(), TimeUnit.MILLISECONDS)
         .readTimeout(config.fetchTimeout.toMillis(), TimeUnit.MILLISECONDS)
         .build()
 
     override suspend fun fetch(ref: PieceRef): ByteArray = withContext(Dispatchers.IO) {
+        val tmp = File.createTempFile("foc-", ".fetch", config.cacheDir.apply { mkdirs() })
+        try {
+            fetchTo(ref, tmp)
+            tmp.readBytes()
+        } finally {
+            tmp.delete()
+        }
+    }
+
+    /**
+     * Races the candidates on response headers, then streams the winner's body into [target].
+     * If the winner fails mid-body, the race is re-run over the remaining candidates.
+     */
+    override suspend fun fetchTo(ref: PieceRef, target: File): Unit = withContext(Dispatchers.IO) {
         val errors = mutableListOf<String>()
-        val candidates = buildCandidates(ref)
+        val candidates = buildCandidates(ref).toMutableList()
 
         if (candidates.isEmpty()) {
             throw PieceUnavailableException(
@@ -75,12 +95,29 @@ internal class RemoteStore(
                         "cdn=${ref.cdnEnabled}, ipfs=${ref.ipfsIndexed})",
             )
         }
+        val total = candidates.size
 
-        hedgedRace(candidates, errors)?.let { return@withContext it }
+        while (candidates.isNotEmpty()) {
+            val (url, response) = hedgedRace(candidates, errors) ?: break
+            candidates.remove(url)
+            try {
+                response.use { resp ->
+                    val body = resp.body ?: throw IOException("Empty response body")
+                    body.byteStream().use { input ->
+                        target.outputStream().use { out -> input.copyTo(out, BODY_BUFFER) }
+                    }
+                }
+                return@withContext
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (e: IOException) {
+                recordError(errors, "$url -> body failed: ${e.javaClass.simpleName}: ${e.message}")
+            }
+        }
 
         throw PieceUnavailableException(
             "No endpoint could serve piece ${ref.pieceCid} " +
-                    "(${candidates.size} candidates). Attempts: " +
+                    "($total candidates). Attempts: " +
                     errors.joinToString("; "),
         )
     }
@@ -127,24 +164,20 @@ internal class RemoteStore(
     // -------------------------------------------------- hedged race
 
     /**
-     * Race [candidates] with hedged parallelism. Returns the first successful
-     * body, cancelling the rest. Every attempt records its outcome in [errors]
-     * for diagnostic purposes when everything fails.
+     * Race [candidates] with hedged parallelism on **response headers**. Returns the first 2xx
+     * response, still open, together with its URL; every other call is cancelled. The caller owns
+     * (and must close) the returned response. Every attempt records its outcome in [errors].
      *
-     * NOTE: The doc describes `synapse.download` as doing parallel `HEAD /piece/{cid}`
-     * probes and then downloading from the first responder. Because our client
-     * targets mobile and pieces are typically small (per-block, not per-DAG),
-     * we skip HEAD and issue GETs directly — the win on latency outweighs the
-     * cost of an extra body-read on a loser. Callers moving to very large
-     * pieces should switch to HEAD-then-GET and are welcome to plug their own
-     * [Retriever] via [FocCache].
+     * Deciding the winner on headers rather than on the full body means losers stop before they
+     * download anything, and the body can be streamed to disk instead of buffered.
      */
     private suspend fun hedgedRace(
         candidates: List<String>,
         errors: MutableList<String>,
-    ): ByteArray? = coroutineScope {
-        val winner = CompletableDeferred<ByteArray>()
+    ): Pair<String, Response>? = coroutineScope {
+        val winner = CompletableDeferred<Pair<String, Response>>()
         val permits = Semaphore(config.maxParallelFetches.coerceAtLeast(1))
+        val calls = java.util.concurrent.ConcurrentHashMap<String, Call>()
         val jobs = mutableListOf<Job>()
 
         for ((index, url) in candidates.withIndex()) {
@@ -156,11 +189,15 @@ internal class RemoteStore(
                     permits.withPermit {
                         if (winner.isCompleted) return@withPermit
                         try {
-                            val bytes = executeAndReadBytes(url)
-                            if (bytes != null) {
-                                winner.complete(bytes)
-                            } else {
-                                recordError(errors, "$url -> non-2xx")
+                            val call = http.newCall(Request.Builder().url(url).get().build())
+                            calls[url] = call
+                            val resp = call.execute()
+                            when {
+                                !resp.isSuccessful -> {
+                                    resp.close()
+                                    recordError(errors, "$url -> non-2xx (${resp.code})")
+                                }
+                                !winner.complete(url to resp) -> resp.close() // lost the race
                             }
                         } catch (ce: CancellationException) {
                             throw ce
@@ -184,6 +221,9 @@ internal class RemoteStore(
         } catch (_: NoWinner) {
             null
         } finally {
+            // execute() blocks and ignores coroutine cancellation, so cancel the calls themselves.
+            val won = if (winner.isCompleted && !winner.isCancelled) runCatching { winner.getCompleted().first }.getOrNull() else null
+            calls.forEach { (url, call) -> if (url != won) call.cancel() }
             jobs.forEach { it.cancel() }
             everyoneDone.cancel()
         }
@@ -192,15 +232,6 @@ internal class RemoteStore(
 
     private fun recordError(errors: MutableList<String>, msg: String) {
         synchronized(errors) { errors.add(msg) }
-    }
-
-    private fun executeAndReadBytes(url: String): ByteArray? {
-        val req = Request.Builder().url(url).get().build()
-        http.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) return null
-            val body = resp.body ?: throw IOException("Empty response body for $url")
-            return body.bytes()
-        }
     }
 
     // -------------------------------------------------- url builders
@@ -223,6 +254,8 @@ internal class RemoteStore(
         return b + p
     }
 }
+
+private const val BODY_BUFFER = 64 * 1024
 
 /** Internal sentinel: "everyone finished without a winner." */
 private object NoWinner : RuntimeException() { private fun readResolve(): Any = NoWinner }

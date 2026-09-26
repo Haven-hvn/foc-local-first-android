@@ -136,7 +136,7 @@ on directly.
 Add the Maven Central dependency in your module's `build.gradle.kts`:
 ```kotlin
 dependencies {
-    implementation("io.github.haven-hvn:foc-cache:0.1.0")
+    implementation("io.github.haven-hvn:foc-cache:0.2.0")
 }
 ```
 
@@ -156,11 +156,35 @@ val cache = FocCache(
 
 `ViewModel`:
 ```kotlin
-val bytes = cache.get(ref)
-cache.stream(ref).collect { chunk -> … }
+val bytes = cache.get(ref)                 // small pieces
+val file = cache.file(ref)                 // large pieces: a local path, nothing in memory
+cache.stream(ref).collect { chunk -> … }   // reads from disk in chunkSize chunks
 cache.exists(ref.pieceCid)
 viewModelScope.launch { cache.fetch(ref) }
 ```
+
+### Transform on store
+
+Pass a `PieceTransform` to have the cache keep something other than the retrieved bytes — for
+example decrypted content, so the key is only needed once:
+
+```kotlin
+val decrypt = PieceTransform { ref, input, output -> myCipher.decrypt(keyFor(ref), input, output) }
+val file = cache.file(ref, decrypt)        // first call: fetch → decrypt → store; later calls: local
+```
+
+It runs once, when the piece first arrives, with both sides as streams. The result is stored under
+the same PieceCID and returned by every later read. The cache doesn't record which transform made
+the stored bytes, so use one transform per piece consistently. Integrity checks must run before the
+transform, since the stored bytes no longer hash to the PieceCID.
+
+### Self-sizing storage
+
+```kotlin
+Config(cacheDir = File(filesDir, "foc"), autoQuota = AutoQuota())  // ½ free + used, 0.5–16 GB
+```
+
+The quota is resolved once, when `FocCache` is built, and `cache.quotaBytes` reports it.
 
 ## Correspondence with logos-storage-nim
 

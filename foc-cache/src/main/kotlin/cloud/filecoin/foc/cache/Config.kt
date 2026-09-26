@@ -13,15 +13,21 @@ import java.time.Duration
  *                                 the LRU evictor drops least-recently-accessed pieces
  *                                 until usage is under the cap. Analog of
  *                                 `storage-quota` (default 21474836480 = 20 GiB).
+ *                                 Ignored when [autoQuota] is set.
+ * @property autoQuota             If set, the quota is sized from the device's free space
+ *                                 when the cache is constructed (see [AutoQuota]), and
+ *                                 [quotaBytes] is only the fallback if free space can't
+ *                                 be read.
  * @property blockTtl              How long a cached piece is considered fresh. Expired
  *                                 pieces are re-fetched on next access. Analog of
  *                                 `block-ttl` (default 30d in nim).
  * @property chunkSize             Streaming chunk size (bytes) for [FocCache.stream].
  *                                 Same role as the `chunkSize` arg in
  *                                 `storage_module_plugin.h::downloadToUrl`.
- * @property fetchTimeout          Per-attempt HTTP timeout when fetching from an SP or
- *                                 gateway. Total wall-clock time for a miss is bounded
- *                                 by (fetchTimeout × total endpoints).
+ * @property fetchTimeout          Per-attempt connect and read-inactivity timeout when
+ *                                 fetching from an SP or gateway. Since 0.2.0 bodies are
+ *                                 streamed to disk, so this bounds a stalled transfer,
+ *                                 not the total time for a large piece.
  * @property maxParallelFetches    Cap on concurrent HTTP fetches for the same
  *                                 piece during the hedged race. FOC pieces are
  *                                 stored on ≥2 SPs (pricing minimum) and often
@@ -49,6 +55,7 @@ import java.time.Duration
 data class Config(
     val cacheDir: File,
     val quotaBytes: Long = 20L * 1024 * 1024 * 1024,
+    val autoQuota: AutoQuota? = null,
     val blockTtl: Duration = Duration.ofDays(30),
     val chunkSize: Int = 64 * 1024,
     val fetchTimeout: Duration = Duration.ofSeconds(30),

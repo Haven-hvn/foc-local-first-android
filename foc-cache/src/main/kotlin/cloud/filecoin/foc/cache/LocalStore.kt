@@ -25,7 +25,8 @@ import kotlin.concurrent.withLock
  * metadata lookup. Suitable for typical mobile access patterns.
  *
  * Layout on disk:
- *   {cacheDir}/pieces/{pieceCid}          — raw bytes
+ *   {cacheDir}/pieces/{pieceCid}          — stored bytes (retrieved, or transformed)
+ *   {cacheDir}/tmp/                       — in-flight downloads and transforms
  *   {cacheDir}/meta.db                    — sqlite metadata
  */
 internal class LocalStore(
@@ -33,8 +34,19 @@ internal class LocalStore(
     private val config: Config,
 ) {
     private val piecesDir: File = File(config.cacheDir, "pieces").apply { mkdirs() }
+    private val tmpDir: File = File(config.cacheDir, "tmp").apply {
+        mkdirs()
+        // Leftovers from a fetch or transform that was interrupted.
+        listFiles()?.forEach { it.delete() }
+    }
     private val meta = MetaDb(context, File(config.cacheDir, "meta.db"))
     private val lock = ReentrantLock()
+
+    /** The quota in force: [Config.quotaBytes], or sized once from free space via [Config.autoQuota]. */
+    val quotaBytes: Long = config.autoQuota?.let { auto ->
+        val free = runCatching { config.cacheDir.usableSpace }.getOrDefault(0L)
+        if (free <= 0L) config.quotaBytes else auto.resolve(meta.totalBytes(), free)
+    } ?: config.quotaBytes
 
     /** True iff bytes for [pieceCid] are on disk and not past their TTL. */
     fun hasBlock(pieceCid: String): Boolean {
@@ -43,8 +55,12 @@ internal class LocalStore(
         return fileFor(pieceCid).isFile
     }
 
-    /** Returns bytes or null; does not touch the network. Bumps last-access on hit. */
-    fun get(pieceCid: String): ByteArray? {
+    /**
+     * The stored file for [pieceCid], or null. Bumps last-access on hit. The path stays valid until
+     * the piece is evicted or removed; a stream already open on it keeps reading after that, since
+     * deleting an open file on Android only unlinks it.
+     */
+    fun file(pieceCid: String): File? {
         val row = meta.find(pieceCid) ?: return null
         if (isExpired(row.expiresAt)) return null
         val f = fileFor(pieceCid)
@@ -54,46 +70,59 @@ internal class LocalStore(
             return null
         }
         meta.touch(pieceCid, Instant.now().toEpochMilli())
-        return f.readBytes()
+        return f
     }
 
+    /** Returns bytes or null; does not touch the network. Bumps last-access on hit. */
+    fun get(pieceCid: String): ByteArray? = file(pieceCid)?.readBytes()
+
     /** Streamed variant of [get]; caller is responsible for closing. */
-    fun openStream(pieceCid: String): InputStream? {
-        if (!hasBlock(pieceCid)) return null
-        meta.touch(pieceCid, Instant.now().toEpochMilli())
-        return FileInputStream(fileFor(pieceCid))
-    }
+    fun openStream(pieceCid: String): InputStream? = file(pieceCid)?.let(::FileInputStream)
+
+    /** A fresh file in the cache's temp area, on the same filesystem as the pieces (so [install] can rename). */
+    fun newTempFile(): File = File.createTempFile("piece-", ".tmp", tmpDir)
 
     /**
      * Atomically write [bytes] under [pieceCid], evicting older entries as needed
      * to stay under the quota. If eviction cannot free enough space, throws
      * [QuotaExceededException].
      */
-    fun put(pieceCid: String, bytes: ByteArray): Unit = lock.withLock {
+    fun put(pieceCid: String, bytes: ByteArray) {
+        val tmp = newTempFile()
+        try {
+            FileOutputStream(tmp).use { it.write(bytes) }
+            install(pieceCid, tmp)
+        } finally {
+            tmp.delete()
+        }
+    }
+
+    /**
+     * Moves [source] (from [newTempFile]) into place under [pieceCid], evicting older entries as
+     * needed. On [QuotaExceededException] nothing is evicted and [source] is left where it is.
+     */
+    fun install(pieceCid: String, source: File): File = lock.withLock {
         val now = Instant.now().toEpochMilli()
         val expiresAt = if (config.blockTtl.isZero) Long.MAX_VALUE
                        else now + config.blockTtl.toMillis()
 
-        val newSize = bytes.size.toLong()
-        require(newSize <= config.quotaBytes) {
-            "Piece $pieceCid ($newSize bytes) exceeds quota ${config.quotaBytes}"
+        val newSize = source.length()
+        if (newSize > quotaBytes) {
+            throw QuotaExceededException("Piece $pieceCid ($newSize bytes) exceeds quota $quotaBytes")
         }
 
         // Compute how much room we need after accounting for any existing copy.
         val existing = meta.find(pieceCid)?.sizeBytes ?: 0L
         val used = meta.totalBytes() - existing
-        val budget = config.quotaBytes - used
-        if (newSize > budget) evictUntil(newSize - budget)
+        val budget = quotaBytes - used
+        if (newSize > budget) evictUntil(newSize - budget, keep = pieceCid)
 
-        // Atomic write: temp file → rename.
         val target = fileFor(pieceCid)
-        val tmp = File(target.parentFile, "${target.name}.tmp")
-        FileOutputStream(tmp).use { it.write(bytes) }
-        if (!tmp.renameTo(target)) {
-            tmp.delete()
+        if (!source.renameTo(target)) {
             throw RuntimeException("Failed to install piece $pieceCid into cache")
         }
         meta.upsert(pieceCid, newSize, now, expiresAt)
+        target
     }
 
     /** Remove one piece; no-op if absent. */
@@ -107,7 +136,7 @@ internal class LocalStore(
     /** Summary suitable for the module's `space()` API. */
     fun space(): SpaceInfo = SpaceInfo(
         totalPieces = meta.count(),
-        quotaMaxBytes = config.quotaBytes,
+        quotaMaxBytes = quotaBytes,
         quotaUsedBytes = meta.totalBytes(),
     )
 
@@ -124,21 +153,29 @@ internal class LocalStore(
     private fun isExpired(expiresAt: Long): Boolean =
         expiresAt != Long.MAX_VALUE && Instant.now().toEpochMilli() > expiresAt
 
-    /** LRU eviction: drop least-recently-accessed pieces until we've freed [needed] bytes. */
-    private fun evictUntil(needed: Long) {
+    /**
+     * LRU eviction: drop least-recently-accessed pieces until we've freed [needed] bytes. Checks
+     * first, so a piece that can't fit evicts nothing. [keep] is the piece being replaced.
+     */
+    private fun evictUntil(needed: Long, keep: String) {
+        var available = 0L
+        meta.forEachByLruAscending { row ->
+            if (row.pieceCid != keep) available += row.sizeBytes
+            available < needed
+        }
+        if (available < needed) {
+            throw QuotaExceededException(
+                "Cannot free $needed bytes under quota $quotaBytes; only $available evictable"
+            )
+        }
         var freed = 0L
         meta.forEachByLruAscending { row ->
             if (freed >= needed) return@forEachByLruAscending false
+            if (row.pieceCid == keep) return@forEachByLruAscending true
             fileFor(row.pieceCid).delete()
             meta.delete(row.pieceCid)
             freed += row.sizeBytes
             true // keep going
-        }
-        if (freed < needed) {
-            throw QuotaExceededException(
-                "Cannot fit ${needed + freed} bytes under quota ${config.quotaBytes}; " +
-                "evicted only $freed bytes"
-            )
         }
     }
 
