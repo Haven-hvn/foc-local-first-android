@@ -70,6 +70,26 @@ internal class RemoteStore(
         .readTimeout(config.fetchTimeout.toMillis(), TimeUnit.MILLISECONDS)
         .build()
 
+    /**
+     * Headers-only availability check. Races the same candidates, in the same order and
+     * with the same 2xx win condition, as [fetchTo] — then closes the winning response
+     * without reading its body. A piece this returns false for is a piece [fetchTo]
+     * could not have served either (modulo a mid-body failure or the piece vanishing
+     * between the two calls), and a true costs no body download and no egress beyond
+     * the request itself.
+     *
+     * Deliberately a GET decided on headers, not HEAD or a Range request: the win
+     * condition must be exactly the one the real fetch uses, and neither HEAD nor
+     * Range support is guaranteed by every candidate endpoint.
+     */
+    override suspend fun probe(ref: PieceRef): Boolean = withContext(Dispatchers.IO) {
+        val candidates = buildCandidates(ref)
+        if (candidates.isEmpty()) return@withContext false
+        val winner = hedgedRace(candidates, mutableListOf()) ?: return@withContext false
+        winner.second.close()
+        true
+    }
+
     override suspend fun fetch(ref: PieceRef): ByteArray = withContext(Dispatchers.IO) {
         val tmp = File.createTempFile("foc-", ".fetch", config.cacheDir.apply { mkdirs() })
         try {

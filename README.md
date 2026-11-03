@@ -82,6 +82,7 @@ added to the hedged race for the IPFS path.
 - `stream(ref)` — same but as `Flow<ByteArray>`; backed by the local store so
   re-reads are hits.
 - `exists(pieceCid)` — pure local check, no network.
+- `isAvailable(ref)` — remote availability check on response headers; see below.
 - `fetch(ref)` — background warm-up; useful before entering offline mode.
 - `remove(pieceCid)` — evict from local cache.
 - `space()` — quota / used / count.
@@ -136,7 +137,7 @@ on directly.
 Add the Maven Central dependency in your module's `build.gradle.kts`:
 ```kotlin
 dependencies {
-    implementation("io.github.haven-hvn:foc-cache:0.2.0")
+    implementation("io.github.haven-hvn:foc-cache:0.3.0")
 }
 ```
 
@@ -162,6 +163,26 @@ cache.stream(ref).collect { chunk -> … }   // reads from disk in chunkSize chu
 cache.exists(ref.pieceCid)
 viewModelScope.launch { cache.fetch(ref) }
 ```
+
+### Check availability before paying for a key
+
+`exists()` is local-only: it answers "do I have it", never "is it still pinned". If opening a
+piece costs something expensive before the bytes arrive — a wallet signature, a key-derivation
+canister call — gate that spend on `isAvailable(ref)`:
+
+```kotlin
+if (!cache.isAvailable(ref)) { /* no longer served; don't prompt for a signature */ }
+val key = acquireKey(ref)
+cache.stream(ref, decryptWith(key)).collect { … }
+```
+
+On a local hit it returns immediately. Otherwise it races the same candidate URLs, in the
+same order and with the same first-2xx-wins rule as a real fetch, and closes the winning
+response after its headers — no body is downloaded, nothing is cached, and no transform runs.
+It is deliberately a GET decided on headers, not HEAD or a Range request, so the answer is
+exactly "the fetch you are about to do would be served". A ref with no candidate endpoints
+answers `false` without any network call. The check is point-in-time: a piece can still
+vanish, or fail mid-body, before the fetch that follows it.
 
 ### Transform on store
 

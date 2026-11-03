@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0
+
+- **`isAvailable(ref)`**: remote availability check to gate expensive work (a wallet signature,
+  a key-derivation call) on a piece still being served. A local hit answers `true` with no
+  network; otherwise the same candidates a fetch would try are raced on response headers —
+  first 2xx wins, losers cancelled, winner closed without reading its body. Nothing is
+  downloaded, cached, or transformed, and a ref with no candidate endpoints answers `false`
+  immediately. Deliberately a GET decided on headers, not HEAD or Range, so the win condition
+  is exactly the fetch's. `Retriever.probe(ref)` is the new hook behind it; it defaults to a
+  full `fetch()`, so custom retrievers keep working, and `RemoteStore` overrides it with the
+  headers-only race.
+
 ## 0.2.0
 
 - **Streaming to disk.** Pieces are downloaded straight into the cache's temp area and installed by

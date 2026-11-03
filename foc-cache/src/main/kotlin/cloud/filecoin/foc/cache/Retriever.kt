@@ -46,4 +46,19 @@ interface Retriever {
     suspend fun fetchTo(ref: PieceRef, target: File) {
         target.writeBytes(fetch(ref))
     }
+
+    /**
+     * Return true iff [ref] can be served right now, without downloading the piece.
+     *
+     * Called only on a local cache miss; not called if the local store already has the
+     * bytes. The default proves availability with a full [fetch] and discards the bytes,
+     * so existing retrievers keep working — mirroring the [fetchTo] default. [RemoteStore]
+     * overrides it with a headers-only race that downloads nothing.
+     */
+    suspend fun probe(ref: PieceRef): Boolean = try {
+        fetch(ref)
+        true
+    } catch (_: PieceUnavailableException) {
+        false
+    }
 }

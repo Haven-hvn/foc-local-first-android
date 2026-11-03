@@ -107,6 +107,27 @@ class FocCache(
     fun exists(pieceCid: String): Boolean = net.exists(pieceCid)
 
     /**
+     * Whether this piece can be served right now — locally, or by any remote candidate
+     * the fetch path would try. Unlike [exists] this hits the network on a local miss,
+     * but only as far as response headers: no body is downloaded and nothing is cached.
+     *
+     * Call it before spending anything expensive on the piece (a wallet signature, a
+     * key-derivation canister call):
+     *
+     * ```kotlin
+     * if (!cache.isAvailable(ref)) return showNoLongerAvailable()
+     * val key = acquireKey(ref)          // only spent once the bytes are proven served
+     * cache.stream(ref, decryptWith(key)).collect { … }
+     * ```
+     *
+     * Point-in-time only: the piece can still vanish, or fail mid-body, before the
+     * following fetch, which keeps throwing [PieceUnavailableException] as today.
+     * A ref with no candidate endpoints (no FilBeam URL, no provider URLs, no IPFS
+     * path) answers false immediately, without any network call.
+     */
+    suspend fun isAvailable(ref: PieceRef): Boolean = net.isAvailable(ref)
+
+    /**
      * Prefetch [ref] into the local cache, applying [transform] if it has to be fetched. Useful as a
      * background job. Idempotent.
      */

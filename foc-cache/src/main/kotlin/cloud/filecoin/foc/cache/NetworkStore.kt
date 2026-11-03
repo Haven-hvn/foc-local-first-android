@@ -94,6 +94,17 @@ internal class NetworkStore(
         }
     }
 
+    /**
+     * Availability check for callers about to spend something expensive on this piece
+     * (a wallet signature, a key-derivation call). A local hit answers true with no
+     * network at all; on a miss the remote is probed on response headers only, so
+     * nothing is downloaded, transformed, or installed.
+     */
+    suspend fun isAvailable(ref: PieceRef): Boolean {
+        if (local.hasBlock(ref.pieceCid)) return true
+        return remote.probe(ref)
+    }
+
     /** Local-only existence check; never hits the network. */
     fun exists(pieceCid: String): Boolean = local.hasBlock(pieceCid)
 
