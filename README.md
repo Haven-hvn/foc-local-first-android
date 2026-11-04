@@ -137,7 +137,7 @@ on directly.
 Add the Maven Central dependency in your module's `build.gradle.kts`:
 ```kotlin
 dependencies {
-    implementation("io.github.haven-hvn:foc-cache:0.3.0")
+    implementation("io.github.haven-hvn:foc-cache:0.3.1")
 }
 ```
 

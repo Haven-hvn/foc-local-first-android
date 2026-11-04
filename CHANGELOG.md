@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1
+
+- **FilBeam URLs now carry the EIP-55 checksummed wallet address.** `PieceRef.filBeamUrl`
+  previously lowercased the per-account subdomain; FilBeam validates that subdomain as an
+  Ethereum address and rejects the lowercase form (`400 Invalid address`), which made every
+  CDN candidate — fetch and `isAvailable` probe alike — fail for indexes that store owners
+  lowercased. The checksum is now derived from the address (Keccak-256, no new dependency),
+  so any input case produces the one host Beam accepts. Malformed addresses fail fast with
+  `IllegalArgumentException` instead of producing an unroutable URL.
+
 ## 0.3.0
 
 - **`isAvailable(ref)`**: remote availability check to gate expensive work (a wallet signature,
