@@ -22,6 +22,8 @@ import kotlinx.serialization.Serializable
  *                               construct FilBeam URLs when [cdnEnabled] is true.
  *                               This is the "per-account subdomain keyed by the
  *                               wallet address that added the piece" from the doc.
+ *                               Any hex case is accepted; the URL derives the
+ *                               EIP-55 checksummed spelling Beam requires.
  * @property cdnEnabled          True iff the data set was uploaded with `withCDN`.
  *                               When true and [walletAddress] is present, the
  *                               library races a FilBeam URL alongside SP probes.
@@ -64,11 +66,19 @@ data class PieceRef(
         }
     }
 
-    /** Full FilBeam URL for this piece, or null if CDN is disabled or wallet address missing. */
+    /**
+     * Full FilBeam URL for this piece, or null if CDN is disabled or wallet address missing.
+     *
+     * The subdomain carries the EIP-55 checksummed spelling of the address:
+     * FilBeam validates the subdomain as an Ethereum address and rejects the
+     * all-lowercase form (`400 Invalid address`), so the case is derived from
+     * the address itself (see [toChecksumAddress]), never inherited from
+     * whatever case the caller happened to store.
+     */
     val filBeamUrl: String?
         get() {
             if (!cdnEnabled) return null
-            val addr = walletAddress?.lowercase() ?: return null
+            val addr = walletAddress?.let { toChecksumAddress(it) } ?: return null
             val host = when (chain) {
                 FocChain.MAINNET -> "${addr}.filbeam.io"
                 FocChain.CALIBRATION -> "${addr}.calibration.filbeam.io"
