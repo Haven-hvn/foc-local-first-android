@@ -32,4 +32,4 @@ jobs:
         run: |
           echo "$GPG_PASSPHRASE" | gpg --batch --pinentry-mode loopback \
             --passphrase-fd 0 --sign /dev/null 2>/dev/null || true
-          ./gradlew :foc-cache:publishToMavenCentral
+          bash ./gradlew :foc-cache:publishToMavenCentral
