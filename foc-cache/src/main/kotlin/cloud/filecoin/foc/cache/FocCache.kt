@@ -50,9 +50,8 @@ class FocCache(
      * The network is a parameter on purpose: warming chains the caller never touches is
      * wasted traffic against the RPC and the chain.
      */
-    suspend fun warmupProviders(chains: List<FocChain>): Unit = withContext(Dispatchers.IO) {
+    suspend fun warmupProviders(chains: List<FocChain>) = withContext(Dispatchers.IO) {
         (remote as? RemoteStore)?.warmup(chains)
-        Unit
     }
 
     /**

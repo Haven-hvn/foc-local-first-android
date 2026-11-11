@@ -6,7 +6,7 @@ plugins {
 
 allprojects {
     group = "io.github.haven-hvn"
-    version = "0.4.2"
+    version = "0.4.3"
 }
 
 subprojects {

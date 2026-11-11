@@ -5,12 +5,14 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import java.io.File
 import java.nio.file.Files
 import java.time.Duration
+import java.util.concurrent.TimeUnit
 
 /**
  * [FilecoinRegistry] writer-independent resolution, driven by a mock Filecoin RPC
@@ -89,6 +91,152 @@ class FilecoinRegistryTest {
                 .setBody("""{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"boom"}}"""),
         )
         assertTrue(registry().findProviders(FocChain.CALIBRATION, "bafkzcibtest").isEmpty())
+    }
+
+    @Test
+    fun `findAnyProvider returns the first serving provider without waiting for slow ones`() = runTest {
+        val fast = MockWebServer().apply { start() }
+        val slowA = MockWebServer().apply { start() }
+        val slowB = MockWebServer().apply { start() }
+        try {
+            val fastUrl = fast.url("/").toString().trimEnd('/')
+            val slowAUrl = slowA.url("/").toString().trimEnd('/')
+            val slowBUrl = slowB.url("/").toString().trimEnd('/')
+            rpc.enqueue(
+                rpcResult(
+                    PageBuilder.page(
+                        listOf(
+                            PageBuilder.provider(1, fastUrl, "fast"),
+                            PageBuilder.provider(2, slowAUrl, "slow-a"),
+                            PageBuilder.provider(3, slowBUrl, "slow-b"),
+                        ),
+                    ),
+                ),
+            )
+            fast.enqueue(MockResponse().setResponseCode(200))
+            // Delay the response headers past the probe timeout.
+            slowA.enqueue(MockResponse().setResponseCode(200).setHeadersDelay(30, TimeUnit.SECONDS))
+            slowB.enqueue(MockResponse().setResponseCode(200).setHeadersDelay(30, TimeUnit.SECONDS))
+
+            val started = System.nanoTime()
+            val found = registry().findAnyProvider(FocChain.CALIBRATION, "bafkzcibtest")
+            val elapsedMs = (System.nanoTime() - started) / 1_000_000
+
+            assertEquals(fastUrl, found?.serviceUrl)
+            // probeTimeout is 2s in the test config; the slow providers must not hold it open.
+            assertTrue("findAnyProvider took ${elapsedMs}ms", elapsedMs < 4_000)
+        } finally {
+            runCatching { fast.close() }
+            runCatching { slowA.close() }
+            runCatching { slowB.close() }
+        }
+    }
+
+    @Test
+    fun `findAnyProvider gives up at probeTimeout when nobody serves the piece`() = runTest {
+        val hanging = MockWebServer().apply { start() }
+        try {
+            val url = hanging.url("/").toString().trimEnd('/')
+            rpc.enqueue(rpcResult(PageBuilder.page(listOf(PageBuilder.provider(1, url, "hanging")))))
+            hanging.enqueue(MockResponse().setResponseCode(200).setHeadersDelay(30, TimeUnit.SECONDS))
+
+            val started = System.nanoTime()
+            val found = registry().findAnyProvider(FocChain.CALIBRATION, "bafkzcibtest")
+            val elapsedMs = (System.nanoTime() - started) / 1_000_000
+
+            assertNull(found)
+            assertTrue("probe took ${elapsedMs}ms", elapsedMs < 4_000)
+        } finally {
+            runCatching { hanging.close() }
+        }
+    }
+
+    @Test
+    fun `per-piece resolution is cached across calls`() = runTest {
+        val providerUrl = provider.url("/").toString().trimEnd('/')
+        rpc.enqueue(rpcResult(PageBuilder.page(listOf(PageBuilder.provider(9, providerUrl, "mock")))))
+        provider.enqueue(MockResponse().setResponseCode(200))
+
+        val registry = registry()
+        val first = registry.findProviders(FocChain.CALIBRATION, "bafkzcibtest")
+        val second = registry.findProviders(FocChain.CALIBRATION, "bafkzcibtest")
+
+        assertEquals(1, first.size)
+        assertEquals(1, second.size)
+        // One HEAD for both calls: the fetch path must not repeat the probe.
+        assertEquals(1, provider.requestCount)
+        assertEquals(1, rpc.requestCount)
+    }
+
+    @Test
+    fun `fetch resolution returns once every probe answered below the target`() = runTest {
+        val providerUrl = provider.url("/").toString().trimEnd('/')
+        rpc.enqueue(
+            rpcResult(
+                PageBuilder.page(
+                    listOf(
+                        PageBuilder.provider(1, providerUrl, "a"),
+                        PageBuilder.provider(2, providerUrl, "b"),
+                        PageBuilder.provider(3, providerUrl, "c"),
+                    ),
+                ),
+            ),
+        )
+        repeat(3) { provider.enqueue(MockResponse().setResponseCode(404)) }
+
+        val started = System.nanoTime()
+        val found = registry().findProviders(FocChain.CALIBRATION, "bafkzcibtest")
+        val elapsedMs = (System.nanoTime() - started) / 1_000_000
+
+        assertTrue(found.isEmpty())
+        // All probes answered quickly; do not sit out the probe timeout.
+        assertTrue("resolution took ${elapsedMs}ms", elapsedMs < 2_000)
+    }
+
+    @Test
+    fun `availability probe feeds the fetch without a second walk`() = runTest {
+        val providerUrl = provider.url("/").toString().trimEnd('/')
+        rpc.enqueue(rpcResult(PageBuilder.page(listOf(PageBuilder.provider(9, providerUrl, "mock")))))
+        provider.enqueue(MockResponse().setResponseCode(200))
+
+        val registry = registry()
+        val any = registry.findAnyProvider(FocChain.CALIBRATION, "bafkzcibtest")
+        val all = registry.findProviders(FocChain.CALIBRATION, "bafkzcibtest")
+
+        assertEquals(providerUrl, any?.serviceUrl)
+        assertEquals(listOf(providerUrl), all.map { it.serviceUrl })
+        assertEquals(1, provider.requestCount)
+        assertEquals(1, rpc.requestCount)
+    }
+
+    @Test
+    fun `remote probe uses the registry HEAD and does not run a GET race`() = runTest {
+        val providerUrl = provider.url("/").toString().trimEnd('/')
+        rpc.enqueue(rpcResult(PageBuilder.page(listOf(PageBuilder.provider(9, providerUrl, "mock")))))
+        provider.enqueue(MockResponse().setResponseCode(200))
+
+        val remote = RemoteStore(
+            Config(
+                cacheDir = tmpDir,
+                fetchTimeout = Duration.ofSeconds(3),
+                maxParallelFetches = 2,
+                enableProviderLookup = false,
+                enableChainProviderResolution = true,
+                registryCacheTtl = Duration.ofMinutes(10),
+                probeTimeout = Duration.ofSeconds(2),
+            ),
+        )
+        val ref = PieceRef(
+            pieceCid = "bafkzcibtest",
+            size = 0,
+            providerServiceUrls = emptyList(),
+            chain = FocChain.CALIBRATION,
+        )
+
+        assertTrue(remote.probe(ref))
+        // Exactly the HEAD from FilecoinRegistry: no second GET from hedgedRace.
+        assertEquals(1, provider.requestCount)
+        assertEquals("HEAD", provider.takeRequest().method)
     }
 }
 
@@ -184,7 +332,7 @@ internal object PageBuilder {
     }
 
     /** One page: `((providerId,…)[], bool hasMore)`. */
-    fun page(providers: List<String>): String {
+    fun page(providers: List<String>, hasMore: Boolean = false): String {
         val provEnc = providers.map { it }.joinToString("")
         val providersArray = buildString {
             append(word(providers.size.toLong()))
@@ -197,7 +345,7 @@ internal object PageBuilder {
         val rootHeadLen = W.toLong() * 2
         val root = buildString {
             append(word(rootHeadLen)) // providers offset
-            append(word(1)) // hasMore = true
+            append(word(if (hasMore) 1L else 0L))
             append(providersArray)
         }
         return "0x" + word(W.toLong()) + root // word0 = root offset

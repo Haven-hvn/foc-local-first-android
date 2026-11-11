@@ -64,6 +64,24 @@ import java.time.Duration
  * @property registryCacheTtl       How long to cache a network's SP-registry read so
  *                                 a burst of pieces does not re-query the chain each time.
  * @property probeTimeout           Per-provider HEAD-probe timeout during chain resolution.
+ *                                 Bounds each provider request (connect, TLS, response)
+ *                                 so an unreachable SP cannot stall the whole probe.
+ * @property probeConcurrency       Maximum concurrent provider HEAD probes during chain
+ *                                 resolution. Probes are headers-only, so this can be much
+ *                                 higher than [maxParallelFetches] (which caps body
+ *                                 transfers). Default 16 keeps a 50+ provider registry
+ *                                 responsive without opening one socket per provider.
+ * @property pieceResolutionTtl    How long a resolved per-piece provider list is cached.
+ *                                 A single piece open probes providers for availability
+ *                                 and then again to fetch; without this the same piece
+ *                                 pays for the full probe multiple times. The cache is
+ *                                 in-memory and dies with the process.
+ * @property negativePieceResolutionTtl
+ *                                 How long a "no provider serves this piece" result is
+ *                                 cached. Shorter than [pieceResolutionTtl] so a piece that
+ *                                 becomes available again is retried quickly, while a
+ *                                 genuinely unavailable piece does not repeat a full
+ *                                 probe on every retry tap.
  */
 data class Config(
     val cacheDir: File,
@@ -82,6 +100,9 @@ data class Config(
     val enableChainProviderResolution: Boolean = true,
     val registryCacheTtl: Duration = Duration.ofDays(7),
     val probeTimeout: Duration = Duration.ofSeconds(8),
+    val probeConcurrency: Int = 16,
+    val pieceResolutionTtl: Duration = Duration.ofMinutes(5),
+    val negativePieceResolutionTtl: Duration = Duration.ofSeconds(30),
 ) {
     init {
         require(quotaBytes > 0) { "quotaBytes must be > 0" }
@@ -91,6 +112,11 @@ data class Config(
         require(!hedgeDelay.isNegative) { "hedgeDelay must be non-negative" }
         require(!registryCacheTtl.isNegative) { "registryCacheTtl must be non-negative" }
         require(!probeTimeout.isNegative) { "probeTimeout must be non-negative" }
+        require(probeConcurrency >= 1) { "probeConcurrency must be >= 1" }
+        require(!pieceResolutionTtl.isNegative) { "pieceResolutionTtl must be non-negative" }
+        require(!negativePieceResolutionTtl.isNegative) {
+            "negativePieceResolutionTtl must be non-negative"
+        }
     }
 
 }

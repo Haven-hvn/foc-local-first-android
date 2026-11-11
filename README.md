@@ -76,7 +76,11 @@ writer-independently (`FilecoinRegistry`):
    `serviceURL` capability (hex-encoded UTF-8 on chain). The registry read is cached
    per network (`Config.registryCacheTtl`).
 2. HEAD-probe `{serviceURL}/piece/{pieceCid}` across those providers; the ones that
-   answer 2xx become direct-SP candidates in the hedged race.
+   answer 2xx become direct-SP candidates in the hedged race. Probes run in parallel
+   (up to `Config.probeConcurrency`, default 16), stop as soon as two providers answer
+   (FOC stores at least two copies), and each is bounded by `Config.probeTimeout`.
+   Resolutions are cached per `(chain, pieceCid)` for `Config.pieceResolutionTtl`, so
+   an availability probe and the fetch that follows do not both walk the registry.
 
 This is the Kotlin port of `@filoz/synapse-core`'s `chainResolver` +
 `findPieceOnProviders`. It requires no provider list in the entity, so it works for

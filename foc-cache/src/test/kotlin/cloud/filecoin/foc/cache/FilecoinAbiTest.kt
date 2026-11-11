@@ -72,7 +72,10 @@ class FilecoinAbiTest {
         // The test-only encoder must be faithful to the contract's layout: a page it
         // builds for (id=9, https://calib.ezpdpz.net, "ezpdpz-calib") must decode to
         // exactly the same fields as the live calibration capture does.
-        val built = PageBuilder.page(listOf(PageBuilder.provider(9, "https://calib.ezpdpz.net", "ezpdpz-calib")))
+        val built = PageBuilder.page(
+            listOf(PageBuilder.provider(9, "https://calib.ezpdpz.net", "ezpdpz-calib")),
+            hasMore = true,
+        )
         val fromBuilt = FilecoinAbi.decodeProvidersPage(built)
 
         val real = FilecoinAbi.decodeProvidersPage(resource("calibration_getProvidersByProductType.hex"))

@@ -4,6 +4,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -70,6 +71,13 @@ internal class RemoteStore(
         .readTimeout(config.fetchTimeout.toMillis(), TimeUnit.MILLISECONDS)
         .build()
 
+    /** Short-lived client for the availability probe; a dead candidate must not stall it. */
+    private val probeHttp: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(config.routingTimeout.toMillis(), TimeUnit.MILLISECONDS)
+        .readTimeout(config.routingTimeout.toMillis(), TimeUnit.MILLISECONDS)
+        .callTimeout(config.routingTimeout.toMillis(), TimeUnit.MILLISECONDS)
+        .build()
+
     /** On-chain SP-registry resolver, used when a [PieceRef] has no explicit providers. */
     private val registry: FilecoinRegistry by lazy { FilecoinRegistry(config) }
 
@@ -78,7 +86,7 @@ internal class RemoteStore(
      * piece miss after app start is not the call that pays for the registry read.
      * No per-piece probes are done; failures are swallowed.
      */
-    internal fun warmup(chains: List<FocChain>) {
+    internal suspend fun warmup(chains: List<FocChain>) {
         if (!config.enableChainProviderResolution) return
         for (chain in chains) {
             runCatching { registry.allProviders(chain) }
@@ -93,16 +101,49 @@ internal class RemoteStore(
      * between the two calls), and a true costs no body download and no egress beyond
      * the request itself.
      *
-     * Deliberately a GET decided on headers, not HEAD or a Range request: the win
-     * condition must be exactly the one the real fetch uses, and neither HEAD nor
-     * Range support is guaranteed by every candidate endpoint.
+     * Writer-independent refs take a faster path: [FilecoinRegistry.findAnyProvider]
+     * HEAD-probes providers in parallel and returns the first one that serves the
+     * piece, then this returns true. It deliberately does not run a second GET race
+     * over the resolved provider — the HEAD already proved the piece is served, and
+     * repeating it is what made the pre-disclosure check wait for the whole registry.
+     * FilBeam is still checked first when enabled, since it is the fastest candidate.
+     *
+     * Deliberately a GET decided on headers, not HEAD or a Range request, for explicit
+     * candidates: the win condition must be exactly the one the real fetch uses, and
+     * neither HEAD nor Range support is guaranteed by every candidate endpoint.
      */
     override suspend fun probe(ref: PieceRef): Boolean = withContext(Dispatchers.IO) {
-        val candidates = buildCandidates(ref)
-        if (candidates.isEmpty()) return@withContext false
-        val winner = hedgedRace(candidates, mutableListOf()) ?: return@withContext false
-        winner.second.close()
-        true
+        coroutineScope {
+            val registryJob = if (ref.providerServiceUrls.isEmpty() && config.enableChainProviderResolution) {
+                async { registry.findAnyProvider(ref.chain, ref.pieceCid) }
+            } else {
+                null
+            }
+
+            // FilBeam first: millisecond latency when it works, and it is already the
+            // first candidate the fetch race would try.
+            val beam = ref.filBeamUrl
+            if (beam != null && probeUrl(beam)) {
+                registryJob?.cancel()
+                return@coroutineScope true
+            }
+
+            if (registryJob?.await() != null) return@coroutineScope true
+
+            // Explicit SPs, IPFS, and (when disabled above) anything else that is not
+            // the on-chain registry. No registry probe is repeated here.
+            val candidates = buildCandidates(ref, includeRegistry = false)
+            if (candidates.isEmpty()) return@coroutineScope false
+            val winner = hedgedRace(candidates, mutableListOf()) ?: return@coroutineScope false
+            winner.second.close()
+            true
+        }
+    }
+
+    private fun probeUrl(url: String): Boolean = try {
+        probeHttp.newCall(Request.Builder().url(url).get().build()).execute().use { it.isSuccessful }
+    } catch (_: Exception) {
+        false
     }
 
     override suspend fun fetch(ref: PieceRef): ByteArray = withContext(Dispatchers.IO) {
@@ -159,7 +200,7 @@ internal class RemoteStore(
 
     // -------------------------------------------------- candidate assembly
 
-    private suspend fun buildCandidates(ref: PieceRef): List<String> {
+    private suspend fun buildCandidates(ref: PieceRef, includeRegistry: Boolean = true): List<String> {
         val out = LinkedHashSet<String>()
 
         // 1. FilBeam first when cdnEnabled — millisecond latency wins the race
@@ -170,13 +211,16 @@ internal class RemoteStore(
         val explicitProviders = ref.providerServiceUrls
         val providerBases = if (explicitProviders.isNotEmpty()) {
             explicitProviders
-        } else if (config.enableChainProviderResolution) {
+        } else if (includeRegistry && config.enableChainProviderResolution) {
             // Writer-independent: the entity carries no provider list (the common
             // case for third-party uploaders), so resolve the piece's providers
             // from the on-chain registry for its network and keep the ones that
-            // actually serve it. Falls back to empty (→ no SP candidates) on any
+            // actually serve it. A resolution from an earlier probe is reused here,
+            // so an availability check and the fetch that follows do not each walk
+            // the whole registry. Falls back to empty (→ no SP candidates) on any
             // chain/probe failure, leaving the CDN/IPFS paths intact.
-            registry.findProviders(ref.chain, ref.pieceCid).map { it.serviceUrl }
+            val cached = registry.cachedProviders(ref.chain, ref.pieceCid)
+            (cached ?: registry.findProviders(ref.chain, ref.pieceCid)).map { it.serviceUrl }
         } else {
             emptyList()
         }

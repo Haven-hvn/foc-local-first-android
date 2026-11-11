@@ -1,13 +1,16 @@
 package cloud.filecoin.foc.cache
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.selects.select
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.add
@@ -15,10 +18,12 @@ import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 /**
@@ -41,47 +46,152 @@ import java.util.concurrent.TimeUnit
  *
  * The registry read is cached per network for [Config.registryCacheTtl] so a burst
  * of pieces does not re-query the chain for each one.
+ *
+ * ### Why per-piece caching matters
+ *
+ * The active PDP registry on Filecoin has dozens of providers, many of them stale or
+ * slow. Probing every one for every piece is expensive: a single piece open used to
+ * pay that cost for the availability probe and again for the fetch. This class caches
+ * the resolved provider list per `(chain, pieceCid)` for [Config.pieceResolutionTtl],
+ * coalesces concurrent resolutions, and stops probing as soon as it has enough
+ * providers to serve the piece (one for an availability check, two for a fetch, since
+ * FOC stores at least two copies). See [resolve] and [probeProviders].
  */
 internal class FilecoinRegistry(
     private val config: Config,
     private val http: OkHttpClient = defaultHttp(config),
+    private val probeHttp: OkHttpClient = defaultProbeHttp(config),
 ) {
     /** One provider that answered a HEAD for the piece, with the base URL to use. */
     data class Provider(val id: Long, val serviceUrl: String)
 
-    private val cache = java.util.concurrent.ConcurrentHashMap<FocChain, CachedRegistry>()
+    private val cache = ConcurrentHashMap<FocChain, CachedRegistry>()
 
     private data class CachedRegistry(val providers: List<Provider>, val fetchedAtMillis: Long)
+
+    /** Per-chain single-flight for the registry read (the list itself is shared). */
+    private val registryLocks = ConcurrentHashMap<FocChain, Mutex>()
+
+    private val pieceCache = ConcurrentHashMap<String, CachedPiece>()
+
+    /** Per-piece single-flight: concurrent callers share one probe instead of repeating it. */
+    private val pieceInflight = ConcurrentHashMap<String, CompletableDeferred<List<Provider>>>()
+
+    private data class CachedPiece(
+        val providers: List<Provider>,
+        val fetchedAtMillis: Long,
+        /** False when the probe stopped early (availability check); the list may be partial. */
+        val complete: Boolean,
+    )
 
     /**
      * Providers on [chain] that currently serve [pieceCid].
      *
-     * Returns an empty list (never throws) when the chain is unreachable, the
-     * registry is empty, or no provider has the piece — callers treat that as
-     * "unresolved" and fall back to whatever other candidates they have.
+     * Probes in parallel and returns as soon as [targetProviders] answer 2xx; on a
+     * partial result (for an availability check) or when the probe times out, it
+     * returns whatever it found. Returns an empty list (never throws) when the chain
+     * is unreachable, the registry is empty, or no provider has the piece — callers
+     * treat that as "unresolved" and fall back to whatever other candidates they have.
      */
     suspend fun findProviders(chain: FocChain, pieceCid: String): List<Provider> =
-        withContext(Dispatchers.IO) {
-            val providers = providersFor(chain)
-            if (providers.isEmpty()) return@withContext emptyList()
-            probeProviders(providers, pieceCid)
+        resolve(chain, pieceCid, targetProviders = MIN_FETCH_PROVIDERS)
+
+    /**
+     * The first provider on [chain] that serves [pieceCid], or null.
+     *
+     * This is the availability-check path: it stops the probe as soon as one provider
+     * answers, so a dead provider later in the registry cannot add its full timeout to
+     * the user's wait. The result is cached like [findProviders], so a fetch immediately
+     * afterwards reuses it instead of probing the registry again.
+     */
+    suspend fun findAnyProvider(chain: FocChain, pieceCid: String): Provider? =
+        resolve(chain, pieceCid, targetProviders = 1).firstOrNull()
+
+    /** Cached resolution for [pieceCid], if one is still fresh. Used by [RemoteStore] on fetch. */
+    suspend fun cachedProviders(chain: FocChain, pieceCid: String): List<Provider>? =
+        withContext(Dispatchers.IO) { freshPiece(chain, pieceCid)?.providers }
+
+    /** Registry contents for [chain], cache-aware. Used by [RemoteStore] warmup. */
+    suspend fun allProviders(chain: FocChain): List<Provider> = providersFor(chain)
+
+    private suspend fun resolve(
+        chain: FocChain,
+        pieceCid: String,
+        targetProviders: Int,
+    ): List<Provider> = withContext(Dispatchers.IO) {
+        val key = pieceKey(chain, pieceCid)
+        freshPiece(chain, pieceCid)?.let { return@withContext it.providers }
+
+        // Coalesce concurrent resolutions for the same piece. Two callers (the
+        // pre-disclosure probe and the fetch) must not both walk 50 providers.
+        val existing = pieceInflight[key]
+        if (existing != null) return@withContext existing.await()
+
+        val deferred = CompletableDeferred<List<Provider>>()
+        if (pieceInflight.putIfAbsent(key, deferred) != null) {
+            return@withContext pieceInflight[key]!!.await()
         }
 
-    /** All active PDP providers on [chain] (cached). */
-    private fun providersFor(chain: FocChain): List<Provider> {
+        try {
+            val providers = providersFor(chain)
+            val found = if (providers.isEmpty()) {
+                emptyList()
+            } else {
+                probeProviders(providers, pieceCid, targetProviders)
+            }
+            // Cache the answer even when it is empty, briefly: a genuinely unavailable
+            // piece should not make every "try again" tap pay for a full probe.
+            pieceCache[key] = CachedPiece(
+                providers = found,
+                fetchedAtMillis = System.currentTimeMillis(),
+                complete = found.size >= targetProviders,
+            )
+            deferred.complete(found)
+            found
+        } catch (e: Throwable) {
+            deferred.completeExceptionally(e)
+            throw e
+        } finally {
+            pieceInflight.remove(key, deferred)
+        }
+    }
+
+    private fun freshPiece(chain: FocChain, pieceCid: String): CachedPiece? {
+        val key = pieceKey(chain, pieceCid)
+        val cached = pieceCache[key] ?: return null
+        val ttl = if (cached.providers.isEmpty()) {
+            config.negativePieceResolutionTtl
+        } else {
+            config.pieceResolutionTtl
+        }
+        if (System.currentTimeMillis() - cached.fetchedAtMillis < ttl.toMillis()) return cached
+        pieceCache.remove(key, cached)
+        return null
+    }
+
+    private fun pieceKey(chain: FocChain, pieceCid: String): String = "$chain:$pieceCid"
+
+    /** All active PDP providers on [chain] (cached, single-flight). */
+    private suspend fun providersFor(chain: FocChain): List<Provider> {
         val cached = cache[chain]
         val now = System.currentTimeMillis()
         if (cached != null && now - cached.fetchedAtMillis < config.registryCacheTtl.toMillis()) {
             return cached.providers
         }
         val network = FilecoinNetworks.resolve(chain) ?: return emptyList()
-        val fetched = fetchProviders(network)
-        cache[chain] = CachedRegistry(fetched, now)
-        return fetched
+        val lock = registryLocks.computeIfAbsent(chain) { Mutex() }
+        return lock.withLock {
+            // Another caller may have filled the cache while we waited for the lock.
+            cache[chain]?.let { current ->
+                if (System.currentTimeMillis() - current.fetchedAtMillis < config.registryCacheTtl.toMillis()) {
+                    return@withLock current.providers
+                }
+            }
+            val fetched = withContext(Dispatchers.IO) { fetchProviders(network) }
+            cache[chain] = CachedRegistry(fetched, System.currentTimeMillis())
+            fetched
+        }
     }
-
-    /** Registry contents for [chain], cache-aware. Used by [RemoteStore] warmup. */
-    internal fun allProviders(chain: FocChain): List<Provider> = providersFor(chain)
 
     /** Page through the registry and collect every provider's serviceURL. */
     private fun fetchProviders(network: FilecoinNetwork): List<Provider> {
@@ -144,34 +254,84 @@ internal class FilecoinRegistry(
         }
     }
 
-    /** HEAD-probe each provider's `/piece/{cid}`; return the ones that answer 2xx. */
-    private suspend fun probeProviders(providers: List<Provider>, pieceCid: String): List<Provider> =
-        withContext(Dispatchers.IO) {
-            val found = ArrayList<Provider>()
-            val semaphore = kotlinx.coroutines.sync.Semaphore(config.maxParallelFetches.coerceAtLeast(1))
-            val lock = Any()
-            coroutineScope {
-                val jobs = providers.map { provider ->
-                    launch {
-                        semaphore.withPermit {
-                            try {
-                                val url = "${provider.serviceUrl.trimEnd('/')}/piece/$pieceCid"
-                                val request = Request.Builder().url(url).head().build()
-                                http.newCall(request).execute().use { response ->
-                                    if (response.isSuccessful) {
-                                        synchronized(lock) { found += provider }
+    /**
+     * HEAD-probe each provider's `/piece/{cid}` in parallel.
+     *
+     * The probe stops as soon as [targetProviders] providers answer 2xx, or when
+     * [Config.probeTimeout] elapses. Both the coroutine jobs and the underlying OkHttp
+     * calls are cancelled on exit: `withTimeoutOrNull` around only `joinAll` does not
+     * cancel the launched jobs, so a single unreachable provider used to keep the whole
+     * probe alive for its full connect/read timeout.
+     */
+    private suspend fun probeProviders(
+        providers: List<Provider>,
+        pieceCid: String,
+        targetProviders: Int,
+    ): List<Provider> = withContext(Dispatchers.IO) {
+        val target = targetProviders.coerceAtLeast(1)
+        val found = ArrayList<Provider>(target)
+        val lock = Any()
+        val semaphore = Semaphore(config.probeConcurrency.coerceAtLeast(1))
+        val calls = ConcurrentHashMap<Long, Call>()
+        val enough = CompletableDeferred<Unit>()
+
+        coroutineScope {
+            val jobs = providers.map { provider ->
+                launch {
+                    semaphore.withPermit {
+                        if (enough.isCompleted) return@withPermit
+                        try {
+                            val url = "${provider.serviceUrl.trimEnd('/')}/piece/$pieceCid"
+                            val call = probeHttp.newCall(Request.Builder().url(url).head().build())
+                            calls[provider.id] = call
+                            call.execute().use { response ->
+                                if (response.isSuccessful) {
+                                    val reachedTarget = synchronized(lock) {
+                                        found += provider
+                                        found.size >= target
                                     }
+                                    if (reachedTarget) enough.complete(Unit)
                                 }
-                            } catch (_: Exception) {
-                                // Unreachable provider: skip.
                             }
+                        } catch (_: Exception) {
+                            // Unreachable provider: skip.
+                        } finally {
+                            calls.remove(provider.id)
                         }
                     }
                 }
-                withTimeoutOrNull(config.probeTimeout.toMillis()) { jobs.joinAll() }
             }
-            found
+
+            try {
+                // Stop as soon as the target is reached, or as soon as every probe has
+                // answered with fewer than the target. If neither happens,
+                // probeTimeout bounds the wait and the caller gets the partial result.
+                val allDone = CompletableDeferred<Unit>()
+                val monitor = launch {
+                    jobs.forEach { it.join() }
+                    allDone.complete(Unit)
+                }
+                try {
+                    withTimeoutOrNull(config.probeTimeout.toMillis()) {
+                        select<Unit?> {
+                            enough.onAwait { Unit }
+                            allDone.onAwait { Unit }
+                        }
+                    }
+                } finally {
+                    monitor.cancel()
+                }
+            } finally {
+                // Cancel the jobs and, crucially, the blocking OkHttp calls. execute()
+                // ignores coroutine cancellation, so cancelling the calls is what actually
+                // stops a dead provider from holding the probe open.
+                jobs.forEach { it.cancel() }
+                calls.values.forEach { it.cancel() }
+            }
         }
+
+        synchronized(lock) { found.toList() }
+    }
 
     companion object {
         /** `enum ProductType { PDP }` — PDP is product type 0. */
@@ -179,12 +339,27 @@ internal class FilecoinRegistry(
         private const val PAGE_LIMIT = 50L
         private const val MAX_PAGES = 50
 
+        /** FOC stores at least two copies; stop probing once two providers serve the piece. */
+        private const val MIN_FETCH_PROVIDERS = 2
+
         private val JSON = "application/json; charset=utf-8".toMediaType()
 
         private fun defaultHttp(config: Config): OkHttpClient =
             OkHttpClient.Builder()
                 .connectTimeout(config.routingTimeout.toMillis(), TimeUnit.MILLISECONDS)
                 .readTimeout(config.routingTimeout.toMillis(), TimeUnit.MILLISECONDS)
+                .build()
+
+        /**
+         * Probes are headers-only and must never inherit the long fetch timeout: a dead
+         * provider has to fail in [Config.probeTimeout], not hold the whole resolution
+         * open for [Config.fetchTimeout].
+         */
+        private fun defaultProbeHttp(config: Config): OkHttpClient =
+            OkHttpClient.Builder()
+                .connectTimeout(config.probeTimeout.toMillis(), TimeUnit.MILLISECONDS)
+                .readTimeout(config.probeTimeout.toMillis(), TimeUnit.MILLISECONDS)
+                .callTimeout(config.probeTimeout.toMillis(), TimeUnit.MILLISECONDS)
                 .build()
     }
 }

@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.3
+
+- **Provider resolution no longer probes the whole registry for every piece, twice.**
+  The active PDP registry on Filecoin has dozens of providers, many stale or slow.
+  `RemoteStore.probe` used to build candidates (which HEAD-probed every provider),
+  then run a second GET race over the result, and `fetchTo` built candidates again —
+  so one piece open could pay the full probe three times. The availability probe now
+  stops at the **first** provider that serves the piece, the fetch reuses the resolved
+  per-piece list, and a resolution is cached per `(chain, pieceCid)` for
+  `pieceResolutionTtl` (5 minutes). `probeTimeout` now actually cancels the in-flight
+  HEAD requests (the previous `withTimeoutOrNull` wrapped only `joinAll`, so the
+  launched jobs and their blocking OkHttp calls kept running), and probes use their own
+  short-timeout client instead of the 30s fetch client.
+- **New `Config` fields:** `probeConcurrency` (default 16; probes are headers-only, so
+  they can be much more parallel than body fetches), `pieceResolutionTtl`, and
+  `negativePieceResolutionTtl` (30s, so an unavailable piece is retried quickly without
+  making every retry tap pay for a full probe).
+- **Fetch stops at two providers.** FOC stores at least two copies; once two providers
+  answer, the probe returns and the hedged fetch race takes over. A piece with only one
+  copy still resolves (the probe falls back to its timeout-bounded partial result).
+- **Behaviour note:** `FocCache.warmupProviders` now pre-fills the registry list only
+  (as before) — the per-piece probe still happens on first use, but it is now the
+  first-provider fast path and is cached for the rest of the open.
+
 ## 0.4.2
 
 - **`registryCacheTtl` default raised from 10 minutes to 7 days.** The active-PDP-provider
