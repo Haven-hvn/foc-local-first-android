@@ -219,8 +219,10 @@ internal class RemoteStore(
             // so an availability check and the fetch that follows do not each walk
             // the whole registry. Falls back to empty (→ no SP candidates) on any
             // chain/probe failure, leaving the CDN/IPFS paths intact.
-            val cached = registry.cachedProviders(ref.chain, ref.pieceCid)
-            (cached ?: registry.findProviders(ref.chain, ref.pieceCid)).map { it.serviceUrl }
+            // findProviders reuses a complete cached resolution and upgrades a partial
+            // availability result, so the fetch gets a hedged list without paying for
+            // the registry read again.
+            registry.findProviders(ref.chain, ref.pieceCid).map { it.serviceUrl }
         } else {
             emptyList()
         }

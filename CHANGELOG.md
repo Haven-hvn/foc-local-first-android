@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.5
+
+- **A partial availability resolution is upgraded by the fetch.** An availability probe
+  stops at the first serving provider (fast, but only one candidate). The fetch now asks
+  `findProviders` for a complete list: a complete cached resolution is reused, while a
+  partial one is probed again (with `probeConcurrency`) to collect a second copy so the
+  hedged race can fail over. A definitive full probe that found fewer than two providers
+  (e.g. a piece with one copy) is marked complete and not probed again.
+- **Probe results report whether they settled.** `probeProviders` now returns
+  `(providers, complete)`: `complete` is true when the target was reached or every
+  provider answered, false on timeout. This is what lets the cache distinguish a fast
+  partial availability hit from a definitive answer.
+
 ## 0.4.4
 
 - **Availability probes fan out to every provider (capped at 64), not `probeConcurrency`.**

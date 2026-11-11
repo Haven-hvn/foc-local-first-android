@@ -194,10 +194,27 @@ class FilecoinRegistryTest {
     }
 
     @Test
-    fun `availability probe feeds the fetch without a second walk`() = runTest {
+    fun `availability probe is cached for repeated availability checks`() = runTest {
         val providerUrl = provider.url("/").toString().trimEnd('/')
         rpc.enqueue(rpcResult(PageBuilder.page(listOf(PageBuilder.provider(9, providerUrl, "mock")))))
         provider.enqueue(MockResponse().setResponseCode(200))
+
+        val registry = registry()
+        val first = registry.findAnyProvider(FocChain.CALIBRATION, "bafkzcibtest")
+        val second = registry.findAnyProvider(FocChain.CALIBRATION, "bafkzcibtest")
+
+        assertEquals(providerUrl, first?.serviceUrl)
+        assertEquals(providerUrl, second?.serviceUrl)
+        assertEquals(1, provider.requestCount)
+        assertEquals(1, rpc.requestCount)
+    }
+
+    @Test
+    fun `fetch upgrades a partial availability resolution to a full probe`() = runTest {
+        val providerUrl = provider.url("/").toString().trimEnd('/')
+        rpc.enqueue(rpcResult(PageBuilder.page(listOf(PageBuilder.provider(9, providerUrl, "mock")))))
+        // One HEAD for the availability probe, one for the fetch's fuller probe.
+        repeat(2) { provider.enqueue(MockResponse().setResponseCode(200)) }
 
         val registry = registry()
         val any = registry.findAnyProvider(FocChain.CALIBRATION, "bafkzcibtest")
@@ -205,7 +222,9 @@ class FilecoinRegistryTest {
 
         assertEquals(providerUrl, any?.serviceUrl)
         assertEquals(listOf(providerUrl), all.map { it.serviceUrl })
-        assertEquals(1, provider.requestCount)
+        // The availability hit is intentionally partial, so the fetch probes again to
+        // get a list it can hedge across; the registry read itself is still cached.
+        assertEquals(2, provider.requestCount)
         assertEquals(1, rpc.requestCount)
     }
 

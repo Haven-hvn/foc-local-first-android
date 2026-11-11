@@ -107,10 +107,6 @@ internal class FilecoinRegistry(
     suspend fun findAnyProvider(chain: FocChain, pieceCid: String): Provider? =
         resolve(chain, pieceCid, targetProviders = 1).firstOrNull()
 
-    /** Cached resolution for [pieceCid], if one is still fresh. Used by [RemoteStore] on fetch. */
-    suspend fun cachedProviders(chain: FocChain, pieceCid: String): List<Provider>? =
-        withContext(Dispatchers.IO) { freshPiece(chain, pieceCid)?.providers }
-
     /** Registry contents for [chain], cache-aware. Used by [RemoteStore] warmup. */
     suspend fun allProviders(chain: FocChain): List<Provider> = providersFor(chain)
 
@@ -120,34 +116,50 @@ internal class FilecoinRegistry(
         targetProviders: Int,
     ): List<Provider> = withContext(Dispatchers.IO) {
         val key = pieceKey(chain, pieceCid)
-        freshPiece(chain, pieceCid)?.let { return@withContext it.providers }
+        // A complete resolution is reusable for any target. A partial one (an availability
+        // probe stopped at the first hit) is only reusable when the caller needs one; a
+        // fetch asks for a complete list and probes again, so it can hedge across copies.
+        freshPiece(chain, pieceCid)?.let { cached ->
+            if (cached.complete || cached.providers.size >= targetProviders) {
+                return@withContext cached.providers
+            }
+        }
 
         // Coalesce concurrent resolutions for the same piece. Two callers (the
         // pre-disclosure probe and the fetch) must not both walk 50 providers.
         val existing = pieceInflight[key]
-        if (existing != null) return@withContext existing.await()
+        if (existing != null) {
+            val result = existing.await()
+            if (result.size >= targetProviders) return@withContext result
+            // The in-flight resolution was a partial availability check; fall through
+            // and run the fuller probe this caller needs.
+        }
 
         val deferred = CompletableDeferred<List<Provider>>()
         if (pieceInflight.putIfAbsent(key, deferred) != null) {
-            return@withContext pieceInflight[key]!!.await()
+            val result = pieceInflight[key]!!.await()
+            if (result.size >= targetProviders) return@withContext result
+            // Same as above: a partial result is not enough for a fetch.
         }
 
         try {
             val providers = providersFor(chain)
             val found = if (providers.isEmpty()) {
-                emptyList()
+                ProbeResult(emptyList(), complete = true)
             } else {
                 probeProviders(providers, pieceCid, targetProviders)
             }
             // Cache the answer even when it is empty, briefly: a genuinely unavailable
-            // piece should not make every "try again" tap pay for a full probe.
+            // piece should not make every "try again" tap pay for a full probe. A
+            // partial availability hit is deliberately not marked complete, so the
+            // fetch that follows can upgrade it to a hedged list.
             pieceCache[key] = CachedPiece(
-                providers = found,
+                providers = found.providers,
                 fetchedAtMillis = System.currentTimeMillis(),
-                complete = found.size >= targetProviders,
+                complete = targetProviders > 1 && found.complete,
             )
-            deferred.complete(found)
-            found
+            deferred.complete(found.providers)
+            found.providers
         } catch (e: Throwable) {
             deferred.completeExceptionally(e)
             throw e
@@ -267,7 +279,7 @@ internal class FilecoinRegistry(
         providers: List<Provider>,
         pieceCid: String,
         targetProviders: Int,
-    ): List<Provider> = withContext(Dispatchers.IO) {
+    ): ProbeResult = withContext(Dispatchers.IO) {
         val target = targetProviders.coerceAtLeast(1)
         val found = ArrayList<Provider>(target)
         val lock = Any()
@@ -321,12 +333,15 @@ internal class FilecoinRegistry(
                     allDone.complete(Unit)
                 }
                 try {
-                    withTimeoutOrNull(config.probeTimeout.toMillis()) {
-                        select<Unit?> {
-                            enough.onAwait { Unit }
-                            allDone.onAwait { Unit }
+                    val settled = withTimeoutOrNull(config.probeTimeout.toMillis()) {
+                        select<Boolean> {
+                            enough.onAwait { true }
+                            allDone.onAwait { true }
                         }
                     }
+                    // `settled` is true when we stopped because the target was reached or
+                    // every provider answered; null means the timeout fired.
+                    synchronized(lock) { ProbeResult(found.toList(), settled == true) }
                 } finally {
                     monitor.cancel()
                 }
@@ -338,9 +353,9 @@ internal class FilecoinRegistry(
                 calls.values.forEach { it.cancel() }
             }
         }
-
-        synchronized(lock) { found.toList() }
     }
+
+    private data class ProbeResult(val providers: List<Provider>, val complete: Boolean)
 
     companion object {
         /** `enum ProductType { PDP }` — PDP is product type 0. */
