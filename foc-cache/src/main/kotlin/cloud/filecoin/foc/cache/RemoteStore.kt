@@ -70,6 +70,9 @@ internal class RemoteStore(
         .readTimeout(config.fetchTimeout.toMillis(), TimeUnit.MILLISECONDS)
         .build()
 
+    /** On-chain SP-registry resolver, used when a [PieceRef] has no explicit providers. */
+    private val registry: FilecoinRegistry by lazy { FilecoinRegistry(config) }
+
     /**
      * Headers-only availability check. Races the same candidates, in the same order and
      * with the same 2xx win condition, as [fetchTo] — then closes the winning response
@@ -152,7 +155,20 @@ internal class RemoteStore(
         ref.filBeamUrl?.let { out += it }
 
         // 2. Direct SP /piece — the default path, all copies.
-        for (sp in ref.providerServiceUrls) {
+        val explicitProviders = ref.providerServiceUrls
+        val providerBases = if (explicitProviders.isNotEmpty()) {
+            explicitProviders
+        } else if (config.enableChainProviderResolution) {
+            // Writer-independent: the entity carries no provider list (the common
+            // case for third-party uploaders), so resolve the piece's providers
+            // from the on-chain registry for its network and keep the ones that
+            // actually serve it. Falls back to empty (→ no SP candidates) on any
+            // chain/probe failure, leaving the CDN/IPFS paths intact.
+            registry.findProviders(ref.chain, ref.pieceCid).map { it.serviceUrl }
+        } else {
+            emptyList()
+        }
+        for (sp in providerBases) {
             out += pieceUrl(sp, ref.pieceCid)
         }
 

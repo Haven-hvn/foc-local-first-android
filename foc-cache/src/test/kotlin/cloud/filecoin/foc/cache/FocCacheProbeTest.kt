@@ -43,6 +43,9 @@ class FocCacheProbeTest {
             maxParallelFetches = 2,
             hedgeDelay = Duration.ofMillis(10),
             enableProviderLookup = false,
+            // This test exercises the pure "no candidate endpoints" path; keep the
+            // on-chain resolver out of it (it would try to resolve from the chain).
+            enableChainProviderResolution = false,
         ),
     )
 
