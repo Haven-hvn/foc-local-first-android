@@ -51,6 +51,19 @@ import java.time.Duration
  *                                 self-hosted Kubo / someguy if you don't want to depend
  *                                 on the public one.
  * @property routingTimeout        HTTP timeout for the routing lookup itself.
+ * @property enableChainProviderResolution
+ *                                 When true (default) and a [PieceRef] carries no
+ *                                 explicit `providerServiceUrls`, resolve the piece's
+ *                                 storage providers from Filecoin's on-chain
+ *                                 ServiceProviderRegistry for [PieceRef.chain] and
+ *                                 HEAD-probe them. This is the writer-independent
+ *                                 retrieval path: it needs no provider list in the
+ *                                 entity, so it works for any uploader. Costs one
+ *                                 cached chain read per network plus a HEAD per
+ *                                 provider per piece.
+ * @property registryCacheTtl       How long to cache a network's SP-registry read so
+ *                                 a burst of pieces does not re-query the chain each time.
+ * @property probeTimeout           Per-provider HEAD-probe timeout during chain resolution.
  */
 data class Config(
     val cacheDir: File,
@@ -65,6 +78,10 @@ data class Config(
     val routingEndpoint: String = ProviderResolver.DEFAULT_ENDPOINT,
 
     val routingTimeout: Duration = Duration.ofSeconds(10),
+
+    val enableChainProviderResolution: Boolean = true,
+    val registryCacheTtl: Duration = Duration.ofMinutes(10),
+    val probeTimeout: Duration = Duration.ofSeconds(8),
 ) {
     init {
         require(quotaBytes > 0) { "quotaBytes must be > 0" }
@@ -72,6 +89,8 @@ data class Config(
         require(!blockTtl.isNegative) { "blockTtl must be non-negative" }
         require(maxParallelFetches >= 1) { "maxParallelFetches must be >= 1" }
         require(!hedgeDelay.isNegative) { "hedgeDelay must be non-negative" }
+        require(!registryCacheTtl.isNegative) { "registryCacheTtl must be non-negative" }
+        require(!probeTimeout.isNegative) { "probeTimeout must be non-negative" }
     }
 
 }

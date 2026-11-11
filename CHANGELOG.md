@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.1
+
+- **Coroutine-based provider HEAD-probes.** `FilecoinRegistry`'s parallel probe now uses
+  `coroutineScope` + `Semaphore` + `withTimeoutOrNull` instead of raw `Thread`s, so it
+  participates in structured concurrency and cancellation like the rest of the library.
+
+## 0.4.0
+
+- **Writer-independent provider resolution from Filecoin's on-chain registry.** A `PieceRef`
+  with no explicit `providerServiceUrls` (the common case for third-party uploaders, who publish
+  only a `piece` locator) now resolves its storage providers from the network's
+  ServiceProviderRegistry via `eth_call` (`FilecoinRegistry`): enumerate active PDP providers,
+  decode each `serviceURL` capability (hex UTF-8 on chain), then HEAD-probe
+  `{serviceURL}/piece/{pieceCid}` and keep the ones that serve the piece. This is the Kotlin port
+  of `@filoz/synapse-core`'s `chainResolver` + `findPieceOnProviders`, with no web3/viem. The
+  registry read is cached per network (`Config.registryCacheTtl`); any chain/probe failure falls
+  back to the other candidates rather than erroring. New `Config` fields:
+  `enableChainProviderResolution` (default true), `registryCacheTtl`, `probeTimeout`. The ABI
+  decoder (`FilecoinAbi`) is tested against real captured `getProvidersByProductType` bytes from
+  both calibration and mainnet.
+
 ## 0.3.1
 
 - **FilBeam URLs now carry the EIP-55 checksummed wallet address.** `PieceRef.filBeamUrl`

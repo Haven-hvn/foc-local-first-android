@@ -66,6 +66,22 @@ aggressiveness.
 
 ## Provider discovery (like `ipfs-check`)
 
+When a `PieceRef` has no explicit `providerServiceUrls` — the common case for
+third-party uploaders, who publish only a `piece` locator — the library resolves
+the piece's storage providers from **Filecoin's on-chain ServiceProviderRegistry**,
+writer-independently (`FilecoinRegistry`):
+
+1. `eth_call` `getProvidersByProductType(PDP, onlyActive)` on the registry for the
+   piece's network (`FocChain.MAINNET` / `CALIBRATION`), decoding each provider's
+   `serviceURL` capability (hex-encoded UTF-8 on chain). The registry read is cached
+   per network (`Config.registryCacheTtl`).
+2. HEAD-probe `{serviceURL}/piece/{pieceCid}` across those providers; the ones that
+   answer 2xx become direct-SP candidates in the hedged race.
+
+This is the Kotlin port of `@filoz/synapse-core`'s `chainResolver` +
+`findPieceOnProviders`. It requires no provider list in the entity, so it works for
+any uploader. Set `Config.enableChainProviderResolution = false` to disable it.
+
 When a `PieceRef` is `ipfsIndexed`, `ProviderResolver` queries **Delegated
 Routing v1** (`GET /routing/v1/providers/{cid}`) at `https://delegated-ipfs.dev`
 by default — the HTTP-shaped front door for the **Amino DHT + IPNI**, which is

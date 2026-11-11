@@ -62,6 +62,7 @@ class FocCacheLocalFirstTest {
                 maxParallelFetches = 2,
                 hedgeDelay = Duration.ofMillis(50),
                 enableProviderLookup = false, // don't hit the real routing endpoint from tests
+                enableChainProviderResolution = false, // refs carry explicit SPs here
             ),
         )
     }
