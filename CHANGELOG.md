@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.4
+
+- **Availability probes fan out to every provider (capped at 64), not `probeConcurrency`.**
+  The active registry has ~50 PDP providers and a piece usually lives on only two. With a
+  16-way cap, the serving provider often sat behind a full batch of dead hosts and the
+  probe waited out its 8s timeout before even reaching it. An availability check is
+  user-initiated, headers-only, and cancelled on the first 2xx, so it now starts one HEAD
+  per provider (bounded at 64 for a hypothetical huge registry). Fetch resolution keeps the
+  smaller `probeConcurrency` cap because it may need two hits and is followed by the body
+  transfer anyway.
+
 ## 0.4.3
 
 - **Provider resolution no longer probes the whole registry for every piece, twice.**

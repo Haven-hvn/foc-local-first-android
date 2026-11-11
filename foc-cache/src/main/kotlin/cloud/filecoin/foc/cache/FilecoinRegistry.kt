@@ -271,7 +271,16 @@ internal class FilecoinRegistry(
         val target = targetProviders.coerceAtLeast(1)
         val found = ArrayList<Provider>(target)
         val lock = Any()
-        val semaphore = Semaphore(config.probeConcurrency.coerceAtLeast(1))
+        // An availability check wants the first hit as fast as possible, so fan out to
+        // every provider: with ~50 active PDPs and only two copies, capping at 16 would
+        // leave the serving provider waiting behind a batch of dead hosts for a full
+        // probe timeout. A fetch can afford the smaller, bandwidth-friendlier cap.
+        val concurrency = if (target == 1) {
+            providers.size.coerceIn(1, MAX_AVAILABILITY_PROBES)
+        } else {
+            config.probeConcurrency.coerceAtLeast(1)
+        }
+        val semaphore = Semaphore(concurrency)
         val calls = ConcurrentHashMap<Long, Call>()
         val enough = CompletableDeferred<Unit>()
 
@@ -341,6 +350,9 @@ internal class FilecoinRegistry(
 
         /** FOC stores at least two copies; stop probing once two providers serve the piece. */
         private const val MIN_FETCH_PROVIDERS = 2
+
+        /** Upper bound on an availability probe's fan-out, even if a registry grows huge. */
+        private const val MAX_AVAILABILITY_PROBES = 64
 
         private val JSON = "application/json; charset=utf-8".toMediaType()
 
