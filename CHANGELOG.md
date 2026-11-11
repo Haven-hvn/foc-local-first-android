@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1
+
+- **Coroutine-based provider HEAD-probes.** `FilecoinRegistry`'s parallel probe now uses
+  `coroutineScope` + `Semaphore` + `withTimeoutOrNull` instead of raw `Thread`s, so it
+  participates in structured concurrency and cancellation like the rest of the library.
+
 ## 0.4.0
 
 - **Writer-independent provider resolution from Filecoin's on-chain registry.** A `PieceRef`
