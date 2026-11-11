@@ -44,6 +44,18 @@ class FocCache(
     private val chunkSize: Int = config.chunkSize
 
     /**
+     * Pre-fill the on-chain SP-registry cache for the given [chains], best-effort, off the
+     * calling thread. Intended for app start: it does no per-piece probing and never
+     * throws — a failed warmup just means the first piece miss pays for the read, as today.
+     * The network is a parameter on purpose: warming chains the caller never touches is
+     * wasted traffic against the RPC and the chain.
+     */
+    suspend fun warmupProviders(chains: List<FocChain>): Unit = withContext(Dispatchers.IO) {
+        (remote as? RemoteStore)?.warmup(chains)
+        Unit
+    }
+
+    /**
      * Local-first retrieval into memory. Returns cached bytes if fresh; otherwise fetches from the
      * first successful SP endpoint (or Trustless Gateway fallback), stores them locally, and returns
      * them. For large pieces prefer [file] or [stream], which never hold the whole piece in memory.

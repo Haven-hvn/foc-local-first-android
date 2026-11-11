@@ -80,7 +80,7 @@ data class Config(
     val routingTimeout: Duration = Duration.ofSeconds(10),
 
     val enableChainProviderResolution: Boolean = true,
-    val registryCacheTtl: Duration = Duration.ofMinutes(10),
+    val registryCacheTtl: Duration = Duration.ofDays(7),
     val probeTimeout: Duration = Duration.ofSeconds(8),
 ) {
     init {

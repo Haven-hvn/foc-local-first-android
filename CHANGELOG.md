@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.2
+
+- **`registryCacheTtl` default raised from 10 minutes to 7 days.** The active-PDP-provider
+  listing on a network changes slowly; re-reading it every 10 minutes was bandwidth and latency
+  spent on a nearly-static answer. The per-piece HEAD probe is unchanged — it still runs on
+  every network operation, as it must to detect a provider gaining or losing the piece.
+  Callers that want the registry to live for the process lifetime (a mobile app session) can
+  pass a very large `registryCacheTtl` (e.g. `Duration.ofDays(365_000)` — `java.time.Duration`
+  has no INFINITE) — the cache is in-memory, so it dies with the process.
+- **New `FocCache.warmupProviders(chains)`.** Best-effort, no per-piece probes: pre-fills the
+  on-chain SP-registry cache for the networks the caller passes — it is parameterised rather
+  than warming every chain, since a deployment only ever reads one of them. Off the calling
+  thread; never throws.
+
 ## 0.4.1
 
 - **Coroutine-based provider HEAD-probes.** `FilecoinRegistry`'s parallel probe now uses

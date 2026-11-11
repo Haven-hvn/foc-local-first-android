@@ -80,6 +80,9 @@ internal class FilecoinRegistry(
         return fetched
     }
 
+    /** Registry contents for [chain], cache-aware. Used by [RemoteStore] warmup. */
+    internal fun allProviders(chain: FocChain): List<Provider> = providersFor(chain)
+
     /** Page through the registry and collect every provider's serviceURL. */
     private fun fetchProviders(network: FilecoinNetwork): List<Provider> {
         val out = LinkedHashMap<Long, String>()

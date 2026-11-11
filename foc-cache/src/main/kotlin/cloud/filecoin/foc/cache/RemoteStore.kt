@@ -74,6 +74,18 @@ internal class RemoteStore(
     private val registry: FilecoinRegistry by lazy { FilecoinRegistry(config) }
 
     /**
+     * Best-effort pre-fill of the on-chain SP-registry cache for [chains], so the first
+     * piece miss after app start is not the call that pays for the registry read.
+     * No per-piece probes are done; failures are swallowed.
+     */
+    internal fun warmup(chains: List<FocChain>) {
+        if (!config.enableChainProviderResolution) return
+        for (chain in chains) {
+            runCatching { registry.allProviders(chain) }
+        }
+    }
+
+    /**
      * Headers-only availability check. Races the same candidates, in the same order and
      * with the same 2xx win condition, as [fetchTo] — then closes the winning response
      * without reading its body. A piece this returns false for is a piece [fetchTo]
